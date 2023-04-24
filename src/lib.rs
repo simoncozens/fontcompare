@@ -1,0 +1,342 @@
+use ab_glyph_rasterizer::Rasterizer;
+use harfbuzz_rs::{shape, DrawFuncs, Face, Font as HBFont, UnicodeBuffer};
+use image::{
+    imageops::flip_vertical_in_place, DynamicImage, GenericImage, ImageBuffer, Luma, Rgba,
+};
+use kurbo::{BezPath, Shape};
+use rayon::{iter::ParallelIterator, prelude::IntoParallelRefIterator};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashSet},
+};
+use thread_local::ThreadLocal;
+
+use pyo3::prelude::*;
+
+#[pyfunction]
+fn diff_many_words(
+    font_a: String,
+    font_b: String,
+    font_size: f32,
+    wordlist: Vec<String>,
+    threshold: f32,
+) -> Vec<(String, String, String, f32)> {
+    let results = _diff_many_words_parallel(&font_a, &font_b, font_size, wordlist, threshold);
+    results
+        .into_iter()
+        .map(|d| (d.word, d.buffer_a, d.buffer_b, d.percent))
+        .collect()
+}
+
+#[pymodule]
+fn fontcompare(py: Python<'_>, m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(diff_many_words, m)?)?;
+    Ok(())
+}
+
+pub struct Renderer<'a> {
+    hb_font: harfbuzz_rs::Owned<HBFont<'a>>,
+    paths_cache: BTreeMap<u32, Vec<BezPath>>,
+}
+
+#[derive(Debug)]
+struct MyDrawFuncs {
+    paths: Vec<BezPath>,
+}
+
+impl DrawFuncs for MyDrawFuncs {
+    fn move_to(&mut self, _st: &harfbuzz_rs::draw_funcs::DrawState, to_x: f32, to_y: f32) {
+        self.paths.push(BezPath::new());
+        self.paths
+            .last_mut()
+            .unwrap()
+            .move_to((to_x as f64, to_y as f64))
+    }
+
+    fn line_to(&mut self, _st: &harfbuzz_rs::draw_funcs::DrawState, to_x: f32, to_y: f32) {
+        self.paths
+            .last_mut()
+            .unwrap()
+            .line_to((to_x as f64, to_y as f64))
+    }
+
+    fn quadratic_to(
+        &mut self,
+        _st: &harfbuzz_rs::draw_funcs::DrawState,
+        control_x: f32,
+        control_y: f32,
+        to_x: f32,
+        to_y: f32,
+    ) {
+        self.paths.last_mut().unwrap().quad_to(
+            (control_x as f64, control_y as f64),
+            (to_x as f64, to_y as f64),
+        )
+    }
+
+    fn cubic_to(
+        &mut self,
+        _st: &harfbuzz_rs::draw_funcs::DrawState,
+        control1_x: f32,
+        control1_y: f32,
+        control2_x: f32,
+        control2_y: f32,
+        to_x: f32,
+        to_y: f32,
+    ) {
+        self.paths.last_mut().unwrap().curve_to(
+            (control1_x as f64, control1_y as f64),
+            (control2_x as f64, control2_y as f64),
+            (to_x as f64, to_y as f64),
+        )
+    }
+
+    fn close_path(&mut self, _st: &harfbuzz_rs::draw_funcs::DrawState) {
+        self.paths.last_mut().unwrap().close_path()
+    }
+}
+
+fn p(p: kurbo::Point) -> ab_glyph_rasterizer::Point {
+    ab_glyph_rasterizer::point(p.x as f32, p.y as f32)
+}
+struct PositionedGlyph {
+    glyph_id: u32,
+    x: f32,
+    y: f32,
+}
+
+impl Renderer<'_> {
+    pub fn new(path: &str, font_size: f32) -> Self {
+        let face = Face::from_file(path, 0).expect("No font");
+        let mut hb_font = HBFont::new(face);
+        hb_font.set_scale(font_size as i32, font_size as i32);
+        Self {
+            hb_font,
+            paths_cache: BTreeMap::new(),
+        }
+    }
+
+    pub fn render_string(&mut self, string: &str) -> (String, ImageBuffer<Luma<u8>, Vec<u8>>) {
+        let buffer = UnicodeBuffer::new().add_str(string);
+        let output = shape(&self.hb_font, buffer, &[]);
+
+        // The results of the shaping operation are stored in the `output` buffer.
+        let positions = output.get_glyph_positions();
+        let mut serialized_buffer = String::new();
+        let infos = output.get_glyph_infos();
+        let mut glyphs: Vec<PositionedGlyph> = vec![];
+        let mut cursor = 0;
+        for (position, info) in positions.iter().zip(infos) {
+            let x = (cursor + position.x_offset) as f32;
+            let y = position.y_offset as f32;
+            glyphs.push(PositionedGlyph {
+                glyph_id: info.codepoint,
+                x,
+                y,
+            });
+            serialized_buffer.push_str(&format!(
+                "gid={},position=0@{},{}+{}|",
+                info.codepoint, x, y, position.x_advance
+            ));
+            cursor += position.x_advance;
+        }
+        let mut all_paths: Vec<BezPath> = vec![];
+        for glyph in glyphs {
+            let mut paths = self
+                .paths_cache
+                .entry(glyph.glyph_id)
+                .or_insert_with(|| {
+                    let drawer = MyDrawFuncs { paths: vec![] };
+                    self.hb_font.draw_glyph(glyph.glyph_id, &drawer);
+                    drawer.paths
+                })
+                .clone();
+            // Translate by X,Y
+            for path in paths.iter_mut() {
+                path.apply_affine(kurbo::Affine::translate((glyph.x as f64, glyph.y as f64)));
+            }
+            all_paths.extend(paths);
+        }
+        let union_bounds = all_paths
+            .iter()
+            .map(|p| p.bounding_box())
+            .reduce(|b1, b2| b1.union(b2))
+            .unwrap();
+
+        let mut rasterizer = Rasterizer::new(
+            union_bounds.width() as usize,
+            union_bounds.height() as usize,
+        );
+
+        // draw
+        for mut path in all_paths {
+            path.apply_affine(kurbo::Affine::translate((
+                -union_bounds.min_x(),
+                -union_bounds.min_y(),
+            )));
+            for seg in path.segments() {
+                match seg {
+                    kurbo::PathSeg::Line(l) => rasterizer.draw_line(p(l.p0), p(l.p1)),
+                    kurbo::PathSeg::Quad(q) => rasterizer.draw_quad(p(q.p0), p(q.p1), p(q.p2)),
+                    kurbo::PathSeg::Cubic(c) => {
+                        rasterizer.draw_cubic(p(c.p0), p(c.p1), p(c.p2), p(c.p3))
+                    }
+                }
+            }
+        }
+
+        let mut image =
+            DynamicImage::new_luma8(union_bounds.width() as u32, union_bounds.height() as u32);
+
+        rasterizer.for_each_pixel_2d(|x, y, alpha| {
+            let amount = (alpha * 255.0) as u8;
+            image.put_pixel(x, y, Rgba([amount, amount, amount, 255]));
+        });
+
+        // Image will be drawn upside down, uncomment if you care.
+        // flip_vertical_in_place(&mut image);
+
+        serialized_buffer.pop();
+        (serialized_buffer, image.into_luma8())
+    }
+}
+
+#[derive(Debug)]
+pub struct Difference {
+    pub word: String,
+    pub buffer_a: String,
+    pub buffer_b: String,
+    // pub diff_map: Vec<i16>,
+    pub percent: f32,
+}
+
+fn _diff_many_words_parallel(
+    font_a: &str,
+    font_b: &str,
+    font_size: f32,
+    wordlist: Vec<String>,
+    threshold: f32,
+) -> Vec<Difference> {
+    let tl_a = ThreadLocal::new();
+    let tl_b = ThreadLocal::new();
+    let tl_cache = ThreadLocal::new();
+    let differences: Vec<Option<Difference>> = wordlist
+        .par_iter()
+        .map(|word| {
+            let renderer_a = tl_a.get_or(|| RefCell::new(Renderer::new(font_a, font_size)));
+            let renderer_b = tl_b.get_or(|| RefCell::new(Renderer::new(font_b, font_size)));
+            let seen_glyphs: &RefCell<HashSet<String>> =
+                tl_cache.get_or(|| RefCell::new(HashSet::new()));
+
+            let (buffer_a, img_a) = renderer_a.borrow_mut().render_string(word);
+            let img_a_vec = img_a.to_vec();
+            if buffer_a
+                .split('|')
+                .all(|glyph| seen_glyphs.borrow().contains(glyph))
+            {
+                return None;
+            }
+            for glyph in buffer_a.split('|') {
+                seen_glyphs.borrow_mut().insert(glyph.to_string());
+            }
+            let (buffer_b, img_b) = renderer_b.borrow_mut().render_string(word);
+            let diff_map: Vec<i16> = img_a_vec
+                .iter()
+                .zip(img_b.to_vec())
+                .map(|(cha, chb)| (*cha as i16 - chb as i16).abs())
+                .collect();
+            let differing_pixels = diff_map.iter().filter(|&&x| x != 0).count();
+            let percent = differing_pixels as f32 / img_a_vec.len() as f32 * 100.0;
+            Some(Difference {
+                word: word.to_string(),
+                buffer_a,
+                buffer_b,
+                // diff_map,
+                percent,
+            })
+        })
+        .collect();
+    differences
+        .into_iter()
+        .flatten()
+        .filter(|diff| diff.percent > threshold)
+        .collect()
+}
+
+fn _diff_many_words_serial(
+    font_a: &str,
+    font_b: &str,
+    font_size: f32,
+    wordlist: Vec<String>,
+    threshold: f32,
+) -> Vec<Difference> {
+    let mut renderer_a = Renderer::new(font_a, font_size);
+    let mut renderer_b = Renderer::new(font_b, font_size);
+    let mut seen_glyphs: HashSet<String> = HashSet::new();
+
+    let mut differences: Vec<Difference> = vec![];
+    for word in wordlist {
+        let (buffer_a, img_a) = renderer_a.render_string(&word);
+        let img_a_vec = img_a.to_vec();
+        if buffer_a.split('|').all(|glyph| seen_glyphs.contains(glyph)) {
+            continue;
+        }
+        for glyph in buffer_a.split('|') {
+            seen_glyphs.insert(glyph.to_string());
+        }
+        let (buffer_b, img_b) = renderer_b.render_string(&word);
+        let diff_map: Vec<i16> = img_a_vec
+            .iter()
+            .zip(img_b.to_vec())
+            .map(|(cha, chb)| (*cha as i16 - chb as i16).abs())
+            .collect();
+        let differing_pixels = diff_map.iter().filter(|&&x| x != 0).count();
+        let percent = differing_pixels as f32 / img_a_vec.len() as f32 * 100.0;
+        if percent > threshold {
+            differences.push(Difference {
+                word: word.to_string(),
+                buffer_a,
+                buffer_b,
+                // diff_map,
+                percent,
+            })
+        }
+    }
+    differences
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs::File,
+        io::{BufRead, BufReader},
+    };
+
+    use super::*;
+
+    #[test]
+    fn test_it_works() {
+        let file = File::open("test-data/Arabic.txt").expect("no such file");
+        let buf = BufReader::new(file);
+        let wordlist = buf
+            .lines()
+            .map(|l| l.expect("Could not parse line"))
+            .collect();
+        use std::time::Instant;
+        let now = Instant::now();
+
+        let mut results = _diff_many_words_parallel(
+            "test-data/NotoSansArabic-Old.ttf",
+            "test-data/NotoSansArabic-New.ttf",
+            20.0,
+            wordlist,
+            10.0,
+        );
+        results.sort_by_key(|f| (f.percent * 100.0) as u32);
+        // for res in results {
+        //     println!("{}: {}%", res.word, res.percent)
+        // }
+        let elapsed = now.elapsed();
+        println!("Elapsed: {:.2?}", elapsed);
+    }
+}
