@@ -118,7 +118,10 @@ impl Renderer<'_> {
         }
     }
 
-    pub fn render_string(&mut self, string: &str) -> (String, ImageBuffer<Luma<u8>, Vec<u8>>) {
+    pub fn render_string(
+        &mut self,
+        string: &str,
+    ) -> Option<(String, ImageBuffer<Luma<u8>, Vec<u8>>)> {
         let buffer = UnicodeBuffer::new().add_str(string);
         let output = shape(&self.hb_font, buffer, &[]);
 
@@ -129,6 +132,9 @@ impl Renderer<'_> {
         let mut glyphs: Vec<PositionedGlyph> = vec![];
         let mut cursor = 0;
         for (position, info) in positions.iter().zip(infos) {
+            if info.codepoint == 0 {
+                return None;
+            }
             let x = (cursor + position.x_offset) as f32;
             let y = position.y_offset as f32;
             glyphs.push(PositionedGlyph {
@@ -172,6 +178,9 @@ impl Renderer<'_> {
             .into_iter()
             .reduce(|b1, b2| b1.union(b2))
             .unwrap_or_default();
+        if union_bounds.width() == 0.0 || union_bounds.height() == 0.0 {
+            return None;
+        }
         let mut rasterizer = Rasterizer::new(
             union_bounds.width() as usize,
             union_bounds.height() as usize,
@@ -206,7 +215,7 @@ impl Renderer<'_> {
         // flip_vertical_in_place(&mut image);
 
         serialized_buffer.pop();
-        (serialized_buffer, image.into_luma8())
+        Some((serialized_buffer, image.into_luma8()))
     }
 }
 
@@ -237,7 +246,7 @@ fn _diff_many_words_parallel(
             let seen_glyphs: &RefCell<HashSet<String>> =
                 tl_cache.get_or(|| RefCell::new(HashSet::new()));
 
-            let (buffer_a, img_a) = renderer_a.borrow_mut().render_string(word);
+            let (buffer_a, img_a) = renderer_a.borrow_mut().render_string(word)?;
             let img_a_vec = img_a.to_vec();
             if buffer_a
                 .split('|')
@@ -248,13 +257,13 @@ fn _diff_many_words_parallel(
             for glyph in buffer_a.split('|') {
                 seen_glyphs.borrow_mut().insert(glyph.to_string());
             }
-            let (buffer_b, img_b) = renderer_b.borrow_mut().render_string(word);
-            let diff_map: Vec<i16> = img_a_vec
+            let (buffer_b, img_b) = renderer_b.borrow_mut().render_string(word)?;
+
+            let differing_pixels = img_a_vec
                 .iter()
                 .zip(img_b.to_vec())
-                .map(|(cha, chb)| (*cha as i16 - chb as i16).abs())
-                .collect();
-            let differing_pixels = diff_map.iter().filter(|&&x| x != 0).count();
+                .filter(|(cha, chb)| (*cha - chb).abs() != 0)
+                .count();
             let percent = differing_pixels as f32 / img_a_vec.len() as f32 * 100.0;
             Some(Difference {
                 word: word.to_string(),
@@ -285,21 +294,29 @@ fn _diff_many_words_serial(
 
     let mut differences: Vec<Difference> = vec![];
     for word in wordlist {
-        let (buffer_a, img_a) = renderer_a.render_string(&word);
-        let img_a_vec = img_a.to_vec();
+        let result_a = renderer_a.render_string(&word);
+        if result_a.is_none() {
+            continue;
+        }
+        let (buffer_a, img_a) = result_a.unwrap();
         if buffer_a.split('|').all(|glyph| seen_glyphs.contains(glyph)) {
             continue;
         }
         for glyph in buffer_a.split('|') {
             seen_glyphs.insert(glyph.to_string());
         }
-        let (buffer_b, img_b) = renderer_b.render_string(&word);
-        let diff_map: Vec<i16> = img_a_vec
+        let result_b = renderer_b.render_string(&word);
+        if result_b.is_none() {
+            continue;
+        }
+        let (buffer_b, img_b) = result_b.unwrap();
+        let img_a_vec = img_a.to_vec();
+        let img_b_vec = img_b.to_vec();
+        let differing_pixels = img_a_vec
             .iter()
-            .zip(img_b.to_vec())
-            .map(|(cha, chb)| (*cha as i16 - chb as i16).abs())
-            .collect();
-        let differing_pixels = diff_map.iter().filter(|&&x| x != 0).count();
+            .zip(img_b_vec)
+            .filter(|(cha, chb)| (*cha - chb).abs() != 0)
+            .count();
         let percent = differing_pixels as f32 / img_a_vec.len() as f32 * 100.0;
         if percent > threshold {
             differences.push(Difference {
