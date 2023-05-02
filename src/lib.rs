@@ -96,9 +96,11 @@ impl DrawFuncs for MyDrawFuncs {
     }
 }
 
+#[inline(always)]
 fn p(p: kurbo::Point) -> ab_glyph_rasterizer::Point {
     ab_glyph_rasterizer::point(p.x as f32, p.y as f32)
 }
+
 struct PositionedGlyph {
     glyph_id: u32,
     x: f32,
