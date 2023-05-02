@@ -89,6 +89,22 @@ impl DrawFuncs for MyDrawFuncs {
     }
 }
 
+fn count_differences(img_a: GrayImage, img_b: GrayImage) -> usize {
+    let min_width = img_a.width().min(img_b.width());
+    let min_height = img_a.height().min(img_b.height());
+    let img_a = crop_imm(&img_a, 0, 0, min_width, min_height).to_image();
+    let img_b = crop_imm(&img_b, 0, 0, min_width, min_height).to_image();
+    let img_a_vec = img_a.to_vec();
+
+    let differing_pixels = img_a_vec
+        .iter()
+        .zip(img_b.to_vec())
+        .filter(|(&cha, chb)| ((cha) as i16 - *chb as i16).abs() != 0)
+        .count();
+    // let percent = differing_pixels as f32 / img_a_vec.len() as f32 * 100.0;
+    differing_pixels
+}
+
 #[inline(always)]
 fn p(p: kurbo::Point) -> ab_glyph_rasterizer::Point {
     ab_glyph_rasterizer::point(p.x as f32, p.y as f32)
@@ -275,20 +291,8 @@ fn _diff_many_words_parallel(
                 seen_glyphs.borrow_mut().insert(glyph.to_string());
             }
             let (buffer_b, img_b) = renderer_b.borrow_mut().render_string(word)?;
+            let percent = count_differences(img_a, img_b) as f32;
 
-            let min_width = img_a.width().min(img_b.width());
-            let min_height = img_a.height().min(img_b.height());
-            let img_a = crop_imm(&img_a, 0, 0, min_width, min_height).to_image();
-            let img_b = crop_imm(&img_b, 0, 0, min_width, min_height).to_image();
-            let img_a_vec = img_a.to_vec();
-
-            let differing_pixels = img_a_vec
-                .iter()
-                .zip(img_b.to_vec())
-                .filter(|(&cha, chb)| ((cha) as i16 - *chb as i16).abs() != 0)
-                .count();
-            // let percent = differing_pixels as f32 / img_a_vec.len() as f32 * 100.0;
-            let percent = differing_pixels as f32;
             Some(Difference {
                 word: word.to_string(),
                 buffer_a,
@@ -334,18 +338,7 @@ fn _diff_many_words_serial(
             continue;
         }
         let (buffer_b, img_b) = result_b.unwrap();
-        let min_width = img_a.width().min(img_b.width());
-        let min_height = img_a.height().min(img_b.height());
-        let img_a = crop_imm(&img_a, 0, 0, min_width, min_height).to_image();
-        let img_b = crop_imm(&img_b, 0, 0, min_width, min_height).to_image();
-        let img_a_vec = img_a.to_vec();
-        let img_b_vec = img_b.to_vec();
-        let differing_pixels = img_a_vec
-            .iter()
-            .zip(img_b_vec)
-            .filter(|(&cha, chb)| ((cha) as i16 - *chb as i16).abs() != 0)
-            .count();
-        let percent = differing_pixels as f32; //  / img_a_vec.len() as f32 * 100.0;
+        let percent = count_differences(img_a, img_b) as f32;
         if percent > threshold {
             differences.push(Difference {
                 word: word.to_string(),
