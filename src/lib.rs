@@ -1,7 +1,7 @@
 use ab_glyph_rasterizer::Rasterizer;
 use harfbuzz_rs::{shape, DrawFuncs, Face, Font as HBFont, FontExtents, UnicodeBuffer};
 use image::{imageops::crop_imm, GrayImage, ImageBuffer, Luma};
-use kurbo::{BezPath, Rect, Shape};
+use kurbo::{BezPath, Shape};
 use rayon::{iter::ParallelIterator, prelude::IntoParallelRefIterator};
 use std::{
     cell::RefCell,
@@ -186,7 +186,7 @@ impl Renderer<'_> {
         let dims = rasterizer.dimensions();
         let mut store = Vec::with_capacity(dims.0 * dims.1);
         rasterizer.for_each_pixel(|_, alpha| {
-            let amount = (alpha * 255.0) as u8;
+            let amount = if alpha > 0.5 { 255 } else { 0 };
             store.push(amount);
         });
         // println!("Store length: {}", store.len());
