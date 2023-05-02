@@ -150,7 +150,10 @@ impl Renderer<'_> {
                 })
                 .clone();
             // Translate by X,Y
-            let translation = kurbo::Affine::translate((glyph.x as f64, glyph.y as f64));
+            let translation = kurbo::Affine::translate((
+                glyph.x as f64,
+                glyph.y as f64 + self.extents.ascender as f64,
+            ));
             for path in paths.iter_mut() {
                 path.apply_affine(translation);
             }
@@ -165,11 +168,7 @@ impl Renderer<'_> {
             (self.extents.ascender - self.extents.descender) as usize,
         );
 
-        for mut path in all_paths {
-            path.apply_affine(kurbo::Affine::translate((
-                0.0,
-                self.extents.ascender as f64,
-            )));
+        for path in all_paths.into_iter() {
             for seg in path.segments() {
                 match seg {
                     kurbo::PathSeg::Line(l) => rasterizer.draw_line(p(l.p0), p(l.p1)),
