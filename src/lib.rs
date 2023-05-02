@@ -36,7 +36,7 @@ fn fontcompare(py: Python<'_>, m: &PyModule) -> PyResult<()> {
 
 pub struct Renderer<'a> {
     hb_font: harfbuzz_rs::Owned<HBFont<'a>>,
-    paths_cache: BTreeMap<u32, Vec<BezPath>>,
+    paths_cache: BTreeMap<u32, (Vec<BezPath>, Rect)>,
 }
 
 #[derive(Debug)]
@@ -143,28 +143,35 @@ impl Renderer<'_> {
             cursor += position.x_advance;
         }
         let mut all_paths: Vec<BezPath> = vec![];
+        let mut all_boxes: Vec<Rect> = vec![];
         for glyph in glyphs {
-            let mut paths = self
+            let (mut paths, bbox) = self
                 .paths_cache
                 .entry(glyph.glyph_id)
                 .or_insert_with(|| {
                     let drawer = MyDrawFuncs { paths: vec![] };
                     self.hb_font.draw_glyph(glyph.glyph_id, &drawer);
-                    drawer.paths
+                    let paths = drawer.paths;
+                    let this_bbox = paths
+                        .iter()
+                        .map(|p| p.bounding_box())
+                        .reduce(|b1, b2| b1.union(b2))
+                        .unwrap_or_default();
+                    (paths, this_bbox)
                 })
                 .clone();
             // Translate by X,Y
+            let translation = kurbo::Affine::translate((glyph.x as f64, glyph.y as f64));
             for path in paths.iter_mut() {
-                path.apply_affine(kurbo::Affine::translate((glyph.x as f64, glyph.y as f64)));
+                path.apply_affine(translation);
             }
+            all_boxes.push(translation.transform_rect_bbox(bbox));
             all_paths.extend(paths);
         }
-        let union_bounds = all_paths
-            .iter()
-            .map(|p| p.bounding_box())
+        let union_bounds = all_boxes
+            .into_iter()
             .reduce(|b1, b2| b1.union(b2))
-            .unwrap();
-
+            .unwrap_or_default();
         let mut rasterizer = Rasterizer::new(
             union_bounds.width() as usize,
             union_bounds.height() as usize,
