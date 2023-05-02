@@ -1,9 +1,7 @@
 use ab_glyph_rasterizer::Rasterizer;
 use harfbuzz_rs::{shape, DrawFuncs, Face, Font as HBFont, UnicodeBuffer};
-use image::{
-    imageops::flip_vertical_in_place, DynamicImage, GenericImage, ImageBuffer, Luma, Rgba,
-};
-use kurbo::{BezPath, Shape};
+use image::{imageops::crop_imm, GrayImage, ImageBuffer, Luma};
+use kurbo::{BezPath, Rect, Shape};
 use rayon::{iter::ParallelIterator, prelude::IntoParallelRefIterator};
 use std::{
     cell::RefCell,
@@ -142,10 +140,7 @@ impl Renderer<'_> {
                 x,
                 y,
             });
-            serialized_buffer.push_str(&format!(
-                "gid={},position=0@{},{}+{}|",
-                info.codepoint, x, y, position.x_advance
-            ));
+            serialized_buffer.push_str(&format!("gid={},position={},{}|", info.codepoint, x, y));
             cursor += position.x_advance;
         }
         let mut all_paths: Vec<BezPath> = vec![];
@@ -181,17 +176,21 @@ impl Renderer<'_> {
         if union_bounds.width() == 0.0 || union_bounds.height() == 0.0 {
             return None;
         }
+        let extents = self.hb_font.get_font_h_extents().unwrap();
+        let width = union_bounds.max_x().ceil();
+
         let mut rasterizer = Rasterizer::new(
-            union_bounds.width() as usize,
-            union_bounds.height() as usize,
+            width as usize,
+            (extents.ascender - extents.descender) as usize,
         );
 
+        // println!("Min Y: {}", union_bounds.min_y());
+        // println!("Max Y: {}", union_bounds.max_y());
+        // println!("Height: {}", union_bounds.height());
+        // println!("Font extents: {:?}", extents);
         // draw
         for mut path in all_paths {
-            path.apply_affine(kurbo::Affine::translate((
-                -union_bounds.min_x(),
-                -union_bounds.min_y(),
-            )));
+            path.apply_affine(kurbo::Affine::translate((0.0, extents.ascender as f64)));
             for seg in path.segments() {
                 match seg {
                     kurbo::PathSeg::Line(l) => rasterizer.draw_line(p(l.p0), p(l.p1)),
@@ -203,19 +202,32 @@ impl Renderer<'_> {
             }
         }
 
-        let mut image =
-            DynamicImage::new_luma8(union_bounds.width() as u32, union_bounds.height() as u32);
-
-        rasterizer.for_each_pixel_2d(|x, y, alpha| {
+        let mut store = vec![];
+        rasterizer.for_each_pixel(|_, alpha| {
             let amount = (alpha * 255.0) as u8;
-            image.put_pixel(x, y, Rgba([amount, amount, amount, 255]));
+            store.push(amount);
         });
+        // println!("Store length: {}", store.len());
+        // println!("width: {}", width);
+        // println!("height: {}", (extents.ascender - extents.descender));
+        // println!(
+        //     "expected: {}",
+        //     width as usize * (extents.ascender - extents.descender) as usize
+        // );
+        // assert!(store.len() == width as usize * (extents.ascender - extents.descender) as usize);
+
+        let image = GrayImage::from_raw(
+            width as u32,
+            (extents.ascender - extents.descender) as u32,
+            store,
+        )
+        .unwrap();
 
         // Image will be drawn upside down, uncomment if you care.
         // flip_vertical_in_place(&mut image);
 
         serialized_buffer.pop();
-        Some((serialized_buffer, image.into_luma8()))
+        Some((serialized_buffer, image))
     }
 }
 
@@ -247,7 +259,6 @@ fn _diff_many_words_parallel(
                 tl_cache.get_or(|| RefCell::new(HashSet::new()));
 
             let (buffer_a, img_a) = renderer_a.borrow_mut().render_string(word)?;
-            let img_a_vec = img_a.to_vec();
             if buffer_a
                 .split('|')
                 .all(|glyph| seen_glyphs.borrow().contains(glyph))
@@ -259,10 +270,16 @@ fn _diff_many_words_parallel(
             }
             let (buffer_b, img_b) = renderer_b.borrow_mut().render_string(word)?;
 
+            let min_width = img_a.width().min(img_b.width());
+            let min_height = img_a.height().min(img_b.height());
+            let img_a = crop_imm(&img_a, 0, 0, min_width, min_height).to_image();
+            let img_b = crop_imm(&img_b, 0, 0, min_width, min_height).to_image();
+            let img_a_vec = img_a.to_vec();
+
             let differing_pixels = img_a_vec
                 .iter()
                 .zip(img_b.to_vec())
-                .filter(|(cha, chb)| (*cha - chb).abs() != 0)
+                .filter(|(&cha, chb)| ((cha) as i16 - *chb as i16).abs() != 0)
                 .count();
             let percent = differing_pixels as f32 / img_a_vec.len() as f32 * 100.0;
             Some(Difference {
@@ -310,12 +327,16 @@ fn _diff_many_words_serial(
             continue;
         }
         let (buffer_b, img_b) = result_b.unwrap();
+        let min_width = img_a.width().min(img_b.width());
+        let min_height = img_a.height().min(img_b.height());
+        let img_a = crop_imm(&img_a, 0, 0, min_width, min_height).to_image();
+        let img_b = crop_imm(&img_b, 0, 0, min_width, min_height).to_image();
         let img_a_vec = img_a.to_vec();
         let img_b_vec = img_b.to_vec();
         let differing_pixels = img_a_vec
             .iter()
             .zip(img_b_vec)
-            .filter(|(cha, chb)| (*cha - chb).abs() != 0)
+            .filter(|(&cha, chb)| ((cha) as i16 - *chb as i16).abs() != 0)
             .count();
         let percent = differing_pixels as f32 / img_a_vec.len() as f32 * 100.0;
         if percent > threshold {
@@ -342,7 +363,7 @@ mod tests {
 
     #[test]
     fn test_it_works() {
-        let file = File::open("test-data/Arabic.txt").expect("no such file");
+        let file = File::open("test-data/Latin.txt").expect("no such file");
         let buf = BufReader::new(file);
         let wordlist = buf
             .lines()
@@ -351,7 +372,7 @@ mod tests {
         use std::time::Instant;
         let now = Instant::now();
 
-        let mut results = _diff_many_words_parallel(
+        let mut results = _diff_many_words_serial(
             "test-data/NotoSansArabic-Old.ttf",
             "test-data/NotoSansArabic-New.ttf",
             20.0,
@@ -364,5 +385,29 @@ mod tests {
         // }
         let elapsed = now.elapsed();
         println!("Elapsed: {:.2?}", elapsed);
+    }
+
+    #[test]
+    fn test_render() {
+        let mut renderer_a = Renderer::new("test-data/NotoSansArabic-Old.ttf", 20.0);
+        let mut renderer_b = Renderer::new("test-data/NotoSansArabic-New.ttf", 20.0);
+        let (_, image_a) = renderer_a.render_string("ظِهَارِيٌّ").unwrap();
+        let (_, image_b) = renderer_b.render_string("ظِهَارِيٌّ").unwrap();
+        image_a.save("image_a.png").expect("Can't save");
+        image_b.save("image_b.png").expect("Can't save");
+        let min_width = image_a.width().min(image_b.width());
+        let min_height = image_a.height().min(image_b.height());
+        let image_a = crop_imm(&image_a, 0, 0, min_width, min_height);
+        let image_b = crop_imm(&image_b, 0, 0, min_width, min_height);
+        let img_a_vec = image_a.to_image().to_vec();
+        let img_b_vec = image_b.to_image().to_vec();
+        let differing_pixels = img_a_vec
+            .iter()
+            .zip(img_b_vec)
+            .filter(|(&cha, chb)| ((cha) as i16 - *chb as i16).abs() != 0)
+            .count();
+        let percent = differing_pixels as f32 / img_a_vec.len() as f32 * 100.0;
+        println!("Percent: {:.2?}%", percent);
+        assert!(percent < 10.0);
     }
 }
