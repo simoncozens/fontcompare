@@ -218,6 +218,7 @@ impl Renderer<'_> {
         let infos = output.get_glyph_infos();
         let mut glyphs: Vec<PositionedGlyph> = vec![];
         let mut cursor = 0;
+        let mut last_advance = 0;
         for (position, info) in positions.iter().zip(infos) {
             if info.codepoint == 0 {
                 return None;
@@ -231,6 +232,7 @@ impl Renderer<'_> {
             });
             serialized_buffer.push_str(&format!("gid={},position={},{}|", info.codepoint, x, y));
             cursor += position.x_advance;
+            last_advance = position.x_advance;
         }
         let last_width: i32 = infos
             .last()
@@ -238,7 +240,7 @@ impl Renderer<'_> {
             .map(|x| x.width)
             .unwrap_or(0);
 
-        let width = cursor + last_width;
+        let width = cursor - last_advance + last_width;
 
         let all_paths = self.glyphs_to_paths(glyphs);
         let rasterizer = self.rasterize(all_paths, width);
