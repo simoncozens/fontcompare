@@ -1,5 +1,5 @@
 use ab_glyph_rasterizer::Rasterizer;
-use harfbuzz_rs::{shape, DrawFuncs, Face, Font as HBFont, UnicodeBuffer};
+use harfbuzz_rs::{shape, DrawFuncs, Face, Font as HBFont, FontExtents, UnicodeBuffer};
 use image::{imageops::crop_imm, GrayImage, ImageBuffer, Luma};
 use kurbo::{BezPath, Rect, Shape};
 use rayon::{iter::ParallelIterator, prelude::IntoParallelRefIterator};
@@ -30,11 +30,6 @@ fn diff_many_words(
 fn fontcompare(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(diff_many_words, m)?)?;
     Ok(())
-}
-
-pub struct Renderer<'a> {
-    hb_font: harfbuzz_rs::Owned<HBFont<'a>>,
-    paths_cache: BTreeMap<u32, (Vec<BezPath>, Rect)>,
 }
 
 #[derive(Debug)]
@@ -105,17 +100,96 @@ struct PositionedGlyph {
     y: f32,
 }
 
+pub struct Renderer<'a> {
+    hb_font: harfbuzz_rs::Owned<HBFont<'a>>,
+    paths_cache: BTreeMap<u32, Vec<BezPath>>,
+    extents: FontExtents,
+}
+
 impl Renderer<'_> {
     pub fn new(path: &str, font_size: f32) -> Self {
         let face = Face::from_file(path, 0).expect("No font");
         let mut hb_font = HBFont::new(face);
         hb_font.set_scale(font_size as i32, font_size as i32);
+        let extents = hb_font.get_font_h_extents().unwrap();
+
         Self {
             hb_font,
             paths_cache: BTreeMap::new(),
+            extents,
         }
     }
 
+    #[inline(never)]
+    fn glyphs_to_paths(&mut self, glyphs: Vec<PositionedGlyph>) -> Vec<BezPath> {
+        let mut all_paths: Vec<BezPath> = vec![];
+        for glyph in glyphs.into_iter() {
+            let mut paths = self
+                .paths_cache
+                .entry(glyph.glyph_id)
+                .or_insert_with(|| {
+                    let drawer = MyDrawFuncs { paths: vec![] };
+                    self.hb_font.draw_glyph(glyph.glyph_id, &drawer);
+                    drawer.paths
+                })
+                .clone();
+            // Translate by X,Y
+            let translation = kurbo::Affine::translate((glyph.x as f64, glyph.y as f64));
+            for path in paths.iter_mut() {
+                path.apply_affine(translation);
+            }
+            all_paths.extend(paths);
+        }
+        all_paths
+    }
+
+    fn rasterize(&self, all_paths: Vec<BezPath>, width: i32) -> Rasterizer {
+        let mut rasterizer = Rasterizer::new(
+            width as usize,
+            (self.extents.ascender - self.extents.descender) as usize,
+        );
+
+        for mut path in all_paths {
+            path.apply_affine(kurbo::Affine::translate((
+                0.0,
+                self.extents.ascender as f64,
+            )));
+            for seg in path.segments() {
+                match seg {
+                    kurbo::PathSeg::Line(l) => rasterizer.draw_line(p(l.p0), p(l.p1)),
+                    kurbo::PathSeg::Quad(q) => rasterizer.draw_quad(p(q.p0), p(q.p1), p(q.p2)),
+                    kurbo::PathSeg::Cubic(c) => {
+                        rasterizer.draw_cubic(p(c.p0), p(c.p1), p(c.p2), p(c.p3))
+                    }
+                }
+            }
+        }
+        rasterizer
+    }
+
+    fn to_image(&self, rasterizer: Rasterizer, width: i32) -> GrayImage {
+        let dims = rasterizer.dimensions();
+        let mut store = Vec::with_capacity(dims.0 * dims.1);
+        rasterizer.for_each_pixel(|_, alpha| {
+            let amount = (alpha * 255.0) as u8;
+            store.push(amount);
+        });
+        // println!("Store length: {}", store.len());
+        // println!("width: {}", width);
+        // println!("height: {}", (extents.ascender - extents.descender));
+        // println!(
+        //     "expected: {}",
+        //     width as usize * (extents.ascender - extents.descender) as usize
+        // );
+        // assert!(store.len() == width as usize * (extents.ascender - extents.descender) as usize);
+
+        GrayImage::from_raw(
+            width as u32,
+            (self.extents.ascender - self.extents.descender) as u32,
+            store,
+        )
+        .unwrap()
+    }
     pub fn render_string(
         &mut self,
         string: &str,
@@ -143,85 +217,17 @@ impl Renderer<'_> {
             serialized_buffer.push_str(&format!("gid={},position={},{}|", info.codepoint, x, y));
             cursor += position.x_advance;
         }
-        let mut all_paths: Vec<BezPath> = vec![];
-        let mut all_boxes: Vec<Rect> = vec![];
-        for glyph in glyphs {
-            let (mut paths, bbox) = self
-                .paths_cache
-                .entry(glyph.glyph_id)
-                .or_insert_with(|| {
-                    let drawer = MyDrawFuncs { paths: vec![] };
-                    self.hb_font.draw_glyph(glyph.glyph_id, &drawer);
-                    let paths = drawer.paths;
-                    let this_bbox = paths
-                        .iter()
-                        .map(|p| p.bounding_box())
-                        .reduce(|b1, b2| b1.union(b2))
-                        .unwrap_or_default();
-                    (paths, this_bbox)
-                })
-                .clone();
-            // Translate by X,Y
-            let translation = kurbo::Affine::translate((glyph.x as f64, glyph.y as f64));
-            for path in paths.iter_mut() {
-                path.apply_affine(translation);
-            }
-            all_boxes.push(translation.transform_rect_bbox(bbox));
-            all_paths.extend(paths);
-        }
-        let union_bounds = all_boxes
-            .into_iter()
-            .reduce(|b1, b2| b1.union(b2))
-            .unwrap_or_default();
-        if union_bounds.width() == 0.0 || union_bounds.height() == 0.0 {
-            return None;
-        }
-        let extents = self.hb_font.get_font_h_extents().unwrap();
-        let width = union_bounds.max_x().ceil();
+        let last_width: i32 = infos
+            .last()
+            .and_then(|x| self.hb_font.get_glyph_extents(x.codepoint))
+            .map(|x| x.width)
+            .unwrap_or(0);
 
-        let mut rasterizer = Rasterizer::new(
-            width as usize,
-            (extents.ascender - extents.descender) as usize,
-        );
+        let width = cursor + last_width;
 
-        // println!("Min Y: {}", union_bounds.min_y());
-        // println!("Max Y: {}", union_bounds.max_y());
-        // println!("Height: {}", union_bounds.height());
-        // println!("Font extents: {:?}", extents);
-        // draw
-        for mut path in all_paths {
-            path.apply_affine(kurbo::Affine::translate((0.0, extents.ascender as f64)));
-            for seg in path.segments() {
-                match seg {
-                    kurbo::PathSeg::Line(l) => rasterizer.draw_line(p(l.p0), p(l.p1)),
-                    kurbo::PathSeg::Quad(q) => rasterizer.draw_quad(p(q.p0), p(q.p1), p(q.p2)),
-                    kurbo::PathSeg::Cubic(c) => {
-                        rasterizer.draw_cubic(p(c.p0), p(c.p1), p(c.p2), p(c.p3))
-                    }
-                }
-            }
-        }
-
-        let mut store = vec![];
-        rasterizer.for_each_pixel(|_, alpha| {
-            let amount = (alpha * 255.0) as u8;
-            store.push(amount);
-        });
-        // println!("Store length: {}", store.len());
-        // println!("width: {}", width);
-        // println!("height: {}", (extents.ascender - extents.descender));
-        // println!(
-        //     "expected: {}",
-        //     width as usize * (extents.ascender - extents.descender) as usize
-        // );
-        // assert!(store.len() == width as usize * (extents.ascender - extents.descender) as usize);
-
-        let image = GrayImage::from_raw(
-            width as u32,
-            (extents.ascender - extents.descender) as u32,
-            store,
-        )
-        .unwrap();
+        let all_paths = self.glyphs_to_paths(glyphs);
+        let rasterizer = self.rasterize(all_paths, width);
+        let image = self.to_image(rasterizer, width);
 
         // Image will be drawn upside down, uncomment if you care.
         // flip_vertical_in_place(&mut image);
@@ -281,7 +287,8 @@ fn _diff_many_words_parallel(
                 .zip(img_b.to_vec())
                 .filter(|(&cha, chb)| ((cha) as i16 - *chb as i16).abs() != 0)
                 .count();
-            let percent = differing_pixels as f32 / img_a_vec.len() as f32 * 100.0;
+            // let percent = differing_pixels as f32 / img_a_vec.len() as f32 * 100.0;
+            let percent = differing_pixels as f32;
             Some(Difference {
                 word: word.to_string(),
                 buffer_a,
@@ -338,7 +345,7 @@ fn _diff_many_words_serial(
             .zip(img_b_vec)
             .filter(|(&cha, chb)| ((cha) as i16 - *chb as i16).abs() != 0)
             .count();
-        let percent = differing_pixels as f32 / img_a_vec.len() as f32 * 100.0;
+        let percent = differing_pixels as f32; //  / img_a_vec.len() as f32 * 100.0;
         if percent > threshold {
             differences.push(Difference {
                 word: word.to_string(),
@@ -391,16 +398,16 @@ mod tests {
     fn test_render() {
         let mut renderer_a = Renderer::new("test-data/NotoSansArabic-Old.ttf", 20.0);
         let mut renderer_b = Renderer::new("test-data/NotoSansArabic-New.ttf", 20.0);
-        let (_, image_a) = renderer_a.render_string("ظِهَارِيٌّ").unwrap();
-        let (_, image_b) = renderer_b.render_string("ظِهَارِيٌّ").unwrap();
-        image_a.save("image_a.png").expect("Can't save");
-        image_b.save("image_b.png").expect("Can't save");
+        let (_, image_a) = renderer_a.render_string("إلآ").unwrap();
+        let (_, image_b) = renderer_b.render_string("إلآ").unwrap();
         let min_width = image_a.width().min(image_b.width());
         let min_height = image_a.height().min(image_b.height());
-        let image_a = crop_imm(&image_a, 0, 0, min_width, min_height);
-        let image_b = crop_imm(&image_b, 0, 0, min_width, min_height);
-        let img_a_vec = image_a.to_image().to_vec();
-        let img_b_vec = image_b.to_image().to_vec();
+        let image_a = crop_imm(&image_a, 0, 0, min_width, min_height).to_image();
+        let image_b = crop_imm(&image_b, 0, 0, min_width, min_height).to_image();
+        image_a.save("image_a.png").expect("Can't save");
+        image_b.save("image_b.png").expect("Can't save");
+        let img_a_vec = image_a.to_vec();
+        let img_b_vec = image_b.to_vec();
         let differing_pixels = img_a_vec
             .iter()
             .zip(img_b_vec)
@@ -408,6 +415,6 @@ mod tests {
             .count();
         let percent = differing_pixels as f32 / img_a_vec.len() as f32 * 100.0;
         println!("Percent: {:.2?}%", percent);
-        assert!(percent < 10.0);
+        assert!(percent < 3.0);
     }
 }
